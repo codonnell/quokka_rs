@@ -18,6 +18,8 @@
 //! [`MemTable`] for querying `Vec<RecordBatch>` by DataFusion.
 
 use arrow_array::Int32Array;
+use datafusion_expr::{BinaryExpr, Operator};
+use datafusion_physical_plan::functions::create_physical_expr;
 use datafusion_physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
 use log::debug;
@@ -61,6 +63,7 @@ pub struct MemTable {
     pub(crate) batches: Vec<PartitionData>,
     constraints: Constraints,
     column_defaults: HashMap<String, Expr>,
+    // TODO: Allow primary key to be something other than i32
     primary_key_index: Arc<RwLock<BTreeMap<i32, (i32, i32, i32)>>>,
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     /// inserting data into this table removes the order
@@ -107,18 +110,17 @@ impl MemTable {
                 .expect("failed to downcast")
                 .values();
 
-            let _ = values.iter().enumerate().map(|(element_idx, element)| {
+            for (value_idx, value) in values.iter().enumerate() {
                 if primary_key_index
                     .insert(
-                        *element,
-                        (partition_idx as i32, batch_idx as i32, element_idx as i32),
+                        *value,
+                        (partition_idx as i32, batch_idx as i32, value_idx as i32),
                     )
                     .is_some()
                 {
                     return plan_err!("Duplicate primary key value.");
                 }
-                Ok(())
-            });
+            }
         }
 
         Ok(Self {
@@ -132,6 +134,82 @@ impl MemTable {
             primary_key_index: Arc::new(RwLock::new(primary_key_index)),
             sort_order: Arc::new(Mutex::new(vec![])),
         })
+    }
+
+    fn supported_filter(&self, expr: &Expr) -> bool {
+        if let Expr::BinaryExpr(binary_expr) = expr {
+            if let (lhs, Operator::Eq, rhs) =
+                (&binary_expr.left, binary_expr.op, &binary_expr.right)
+            {
+                if let (Expr::Column(c), Expr::Literal(_)) = (lhs.as_ref(), rhs.as_ref()) {
+                    &c.name
+                        == self
+                            .schema()
+                            .metadata()
+                            .get("primary_key")
+                            .expect("primary key is required")
+                } else if let (Expr::Literal(_), Expr::Column(c)) = (lhs.as_ref(), rhs.as_ref()) {
+                    &c.name
+                        == self
+                            .schema()
+                            .metadata()
+                            .get("primary_key")
+                            .expect("primary key is required")
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn primary_key_filter(&self, expr: &Expr) -> Option<i32> {
+        if let Expr::BinaryExpr(binary_expr) = expr {
+            if let (lhs, Operator::Eq, rhs) =
+                (&binary_expr.left, binary_expr.op, &binary_expr.right)
+            {
+                if let (Expr::Column(c), Expr::Literal(l)) = (lhs.as_ref(), rhs.as_ref()) {
+                    if &c.name
+                        == self
+                            .schema()
+                            .metadata()
+                            .get("primary_key")
+                            .expect("primary key is required")
+                    {
+                        match l {
+                            datafusion::scalar::ScalarValue::Int32(v) => *v,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else if let (Expr::Literal(l), Expr::Column(c)) = (lhs.as_ref(), rhs.as_ref()) {
+                    if &c.name
+                        == self
+                            .schema()
+                            .metadata()
+                            .get("primary_key")
+                            .expect("primary key is required")
+                    {
+                        match l {
+                            datafusion::scalar::ScalarValue::Int32(v) => *v,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     /// Assign constraints
@@ -247,9 +325,24 @@ impl TableProvider for MemTable {
         &self,
         state: &SessionState,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // TODO: Fill out the full set of operators we can optimize with our index
+        let primary_key_filter = filters
+            .iter()
+            .find_map(|expr| self.primary_key_filter(expr));
+        if let Some(i) = primary_key_filter {
+            let primary_key_index = self.primary_key_index.read().await;
+            if let Some((partition_idx, batch_idx, value_idx)) = (*primary_key_index).get(&i) {
+                let batches = self.batches[*partition_idx as usize].read().await;
+                let batch = &batches[*batch_idx as usize];
+                let partitions = vec![vec![batch.slice(*value_idx as usize, 1)]];
+                let exec = MemoryExec::try_new(&partitions, self.schema(), projection.cloned())?;
+                return Ok(Arc::new(exec));
+            }
+        }
+        // TODO: Use tree that supports duplicate keys
         let mut partitions = vec![];
         for arc_inner_vec in self.batches.iter() {
             let inner_vec = arc_inner_vec.read().await;
@@ -297,6 +390,8 @@ impl TableProvider for MemTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // TODO: Update primary key index here
+        //
         // If we are inserting into the table, any sort order may be messed up so reset it here
         *self.sort_order.lock() = vec![];
 
@@ -403,6 +498,7 @@ mod tests {
     use datafusion::datasource::provider_as_source;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
+    use datafusion_common::Column;
     use datafusion_expr::LogicalPlanBuilder;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -434,6 +530,10 @@ mod tests {
         )?;
 
         let provider = MemTable::try_new(schema, vec![vec![batch]])?;
+        println!(
+            "primary key index: {:?}",
+            provider.primary_key_index.read().await
+        );
 
         // scan with projection
         let exec = provider
@@ -450,6 +550,57 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_with_primary_key_filter() -> Result<()> {
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("primary_key".to_string(), "a".to_string());
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, false),
+                Field::new("d", DataType::Int32, true),
+            ],
+            schema_metadata,
+        ));
+        // Create and register the initial table with the provided schema and data
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
+                Arc::new(Int32Array::from(vec![None, None, Some(9)])),
+            ],
+        )?;
+
+        let provider = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+        session_ctx.register_table("t", provider.clone())?;
+
+        // scan with projection
+        let column = datafusion_expr::Expr::Column(Column::from_qualified_name("t.a"));
+        let literal =
+            datafusion_expr::Expr::Literal(datafusion_common::ScalarValue::Int32(Some(1)));
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(column),
+            op: Operator::Eq,
+            right: Box::new(literal),
+        });
+        let exec = provider
+            .scan(&session_ctx.state(), Some(&vec![2, 1]), &[filter], None)
+            .await?;
+
+        let mut it = exec.execute(0, task_ctx)?;
+        let batch2 = it.next().await.unwrap()?;
+        assert_eq!(2, batch2.schema().fields().len());
+        assert_eq!("c", batch2.schema().field(0).name());
+        assert_eq!("b", batch2.schema().field(1).name());
+        assert_eq!(1, batch2.num_rows());
+
+        Ok(())
+    }
     #[tokio::test]
     async fn test_without_projection() -> Result<()> {
         let session_ctx = SessionContext::new();
@@ -646,9 +797,9 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             Arc::new(schema2),
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
                 Arc::new(Int32Array::from(vec![4, 5, 6])),
-                Arc::new(Int32Array::from(vec![7, 8, 9])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
             ],
         )?;
 
@@ -735,6 +886,14 @@ mod tests {
         val
     }
 
+    fn build_test_batch(schema: SchemaRef, pk: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![pk, pk + 1, pk + 2]))],
+        )
+        .expect("could not create test batch")
+    }
+
     // Test inserting a single batch of data into a single partition
     #[tokio::test]
     async fn test_insert_into_single_partition() -> Result<()> {
@@ -746,14 +905,13 @@ mod tests {
             schema_metadata,
         ));
 
-        // Create a new batch of data to insert into the table
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
         // Run the experiment and obtain the resulting data in the table
-        let resulting_data_in_table =
-            experiment(schema, vec![vec![batch.clone()]], vec![vec![batch.clone()]]).await?;
+        let resulting_data_in_table = experiment(
+            schema.clone(),
+            vec![vec![build_test_batch(schema.clone(), 1)]],
+            vec![vec![build_test_batch(schema.clone(), 2)]],
+        )
+        .await?;
         // Ensure that the table now contains two batches of data in the same partition
         assert_eq!(resulting_data_in_table[0].len(), 2);
         Ok(())
@@ -770,16 +928,14 @@ mod tests {
             schema_metadata,
         ));
 
-        // Create a new batch of data to insert into the table
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
         // Run the experiment and obtain the resulting data in the table
         let resulting_data_in_table = experiment(
-            schema,
-            vec![vec![batch.clone()]],
-            vec![vec![batch.clone()], vec![batch]],
+            schema.clone(),
+            vec![vec![build_test_batch(schema.clone(), 1)]],
+            vec![
+                vec![build_test_batch(schema.clone(), 4)],
+                vec![build_test_batch(schema.clone(), 7)],
+            ],
         )
         .await?;
         // Ensure that the table now contains three batches of data in the same partition
@@ -798,18 +954,22 @@ mod tests {
             schema_metadata,
         ));
 
-        // Create a new batch of data to insert into the table
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
         // Run the experiment and obtain the resulting data in the table
         let resulting_data_in_table = experiment(
-            schema,
-            vec![vec![batch.clone()], vec![batch.clone()]],
+            schema.clone(),
             vec![
-                vec![batch.clone(), batch.clone()],
-                vec![batch.clone(), batch],
+                vec![build_test_batch(schema.clone(), 1)],
+                vec![build_test_batch(schema.clone(), 4)],
+            ],
+            vec![
+                vec![
+                    build_test_batch(schema.clone(), 7),
+                    build_test_batch(schema.clone(), 10),
+                ],
+                vec![
+                    build_test_batch(schema.clone(), 13),
+                    build_test_batch(schema.clone(), 16),
+                ],
             ],
         )
         .await?;
@@ -836,8 +996,11 @@ mod tests {
         )?;
         // Run the experiment and obtain the resulting data in the table
         let resulting_data_in_table = experiment(
-            schema,
-            vec![vec![batch.clone(), batch.clone()]],
+            schema.clone(),
+            vec![vec![
+                build_test_batch(schema.clone(), 1),
+                build_test_batch(schema.clone(), 4),
+            ]],
             vec![vec![]],
         )
         .await?;

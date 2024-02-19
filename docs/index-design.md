@@ -11,3 +11,15 @@ If the user updates an indexed attribute, we continue to store the old indexed k
 If the user updates the primary key, then we do a delete and insert with the new primary key. This means the primary key index must support duplicates.
 
 There is a good discussion of this in CMU's advanced database class [here](https://youtu.be/1Od_SuOQshM?si=V9OBArzq3EF9ogD3&t=4178).
+
+## Planner
+
+There are a couple of ways indexes could be integrated into the system for scanning tables efficiently. We'll leave off using them for joins for now.
+
+### Hidden inside table provider
+
+We could look for an appropriate index in our custom table provider and use one if available. This has the disadvantage of not being visible to the physical plan optimizer, but requires less work to implement.
+
+### New index scan / index join execution plan
+
+We could add an index scan execution plan. The physical plan optimizer can then take it into account.
