@@ -23,3 +23,24 @@ We could look for an appropriate index in our custom table provider and use one 
 ### New index scan / index join execution plan
 
 We could add an index scan execution plan. The physical plan optimizer can then take it into account.
+
+# Custom B Tree Index
+
+## Problems with std::collections::BTreeMap
+
+* Doesn't support range scans (iterator starting at a certain key)
+  * This is actually possible using the `btree_cursors` experimental API (see the [github issue](https://github.com/rust-lang/rust/issues/107540))
+* Doesn't support concurrent access from multiple threads
+* Doesn't support duplicate keys
+  * From [Graefe's B-Tree Survey](https://w6113.github.io/files/papers/btreesurvey-graefe.pdf) page 224, can add a unique identifier to key when non-unique, like a ctid.
+  * If sort order uses the column value first, can use an iterator to find the right value.
+
+## Custom B Tree Design
+
+* Sibling pointers between leaf nodes to enable fast iteration
+* Thread safe using optimistic latch crabbing with something like `parking_lot::RwLock`.
+* Supports duplicate keys? Or maybe we use the extra identifier instead.
+
+We need to be careful about how we store our B tree in memory. It is better to store values in nodes rather than pointers, as it allows for fewer cache misses in the CPU. This implies that we should allocate a fixed length array per tree node. However, we do not know the size of any given index at compile time--it is dynamically determined at runtime based on the type of the column. Arrow solves a similar problem by internally allocating a byte butter and interpreting its data dynamically using reflection. I think it should be possible to do something similar and store nodes as a `Vec`.
+
+It also begs the question of what we should do for variable length columns like strings. The most efficient option is probably to do the "German style layout" described in section 3.1 of [this paper](https://db.in.tum.de/~freitag/papers/p29-neumann-cidr20.pdf).
