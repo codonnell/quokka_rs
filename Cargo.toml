@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.79"
 arrow = { version = "50.0.0", features = ["prettyprint"] }
 arrow-array = { version = "50.0.0", default-features = false, features = [
   "chrono-tz",
@@ -17,16 +18,27 @@ arrow-ord = { version = "50.0.0", default-features = false }
 arrow-schema = { version = "50.0.0", default-features = false }
 arrow-string = { version = "50.0.0", default-features = false }
 async-trait = "0.1"
-roaring = "0.10.3"
-anyhow = "1.0.79"
+dashmap = "5.5.3"
 datafusion = "36.0.0"
 datafusion-common = "36.0.0"
 datafusion-execution = "36.0.0"
 datafusion-expr = "36.0.0"
 datafusion-physical-plan = "36.0.0"
 datafusion-sql = "36.0.0"
+env_logger = "0.11.2"
+itertools = "0.12"
 futures = "0.3"
 log = "^0.4"
+mimalloc = "0.1.39"
 parking_lot = "0.12"
+prost = "0.12.3"
+prost-derive = "0.12.3"
+roaring = "0.10.3"
 sqlparser = "0.43.1"
 tokio = { version = "1.0", features = ["full"] }
+# Have to wait to upgrade this until arrow upgrades to 0.11, which should happen in the next release
+tonic = "0.10"
+uuid = "1.7.0"
+
+[build-dependencies]
+tonic-build = "0.11.0"

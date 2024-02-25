@@ -104,6 +104,18 @@ Borrowing from the layout of [noisepage](https://github.com/cmu-db/noisepage/blo
 
 Do we need to store the number of attributes and their sizes in a block? For the database, I don't think so. Is there a problem with getting that information from the catalog? Maybe MVCC while the catalog is changing? Maybe it's in the layout to match Apache Arrow?
 
+### Implementation
+
+Arrow has put a ridiculous amount of work into efficiently storing data in memory for processing. I was previously concerned that arrow is immutable, but `arrow_buffer::buffer::immutable::Buffer` can be converted to a mutable buffer without a copy as long as it's not shared. The "as long as it's not shared" thing might be problematic. The advantage of the immutable buffer is that it can be accessed across multiple threads, while a `Vec` cannot. A reasonable approach to start with might be to retry, spinlock-style, to grab ownership of the buffer. For reads, we should clone the buffers as soon as possible.
+
+How do we deal with race conditions on reading data from a tuple? For example, reader thread reads transaction id 1, then writer thread writes transaction id 2 and a column value, then reader thread reads the updated column value. Do we need a `RwLock` on the block? On the tuple?
+
+What if the reader checks the timestamp before and after reading?
+
+Classic timestamp ordering _does_ use a per-tuple latch to prevent these concurrency issues. Maybe it makes sense to clone the block when doing a write, and take a write lock on the block for only long enough to swap in the new block version?
+
+For now we'll do the simplest thing and lock the full record batch when doing an update. We can get fancy later.
+
 ## Catalog
 
 The catalog will start with just three tables:

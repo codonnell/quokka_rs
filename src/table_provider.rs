@@ -53,6 +53,8 @@ use datafusion::physical_planner::create_physical_sort_expr;
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 
+type TupletOffset = (i32, i32, i32);
+
 /// In-memory data source for presenting a `Vec<RecordBatch>` as a
 /// data source that can be queried by DataFusion. This allows data to
 /// be pre-loaded into memory and then repeatedly queried without
@@ -64,7 +66,7 @@ pub struct MemTable {
     constraints: Constraints,
     column_defaults: HashMap<String, Expr>,
     // TODO: Allow primary key to be something other than i32
-    primary_key_index: Arc<RwLock<BTreeMap<i32, (i32, i32, i32)>>>,
+    primary_key_index: Arc<RwLock<BTreeMap<i32, TupletOffset>>>,
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     /// inserting data into this table removes the order
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
